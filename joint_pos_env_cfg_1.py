@@ -239,6 +239,6 @@ class E0509CubeLiftEnvCfg_PLAY(E0509CubeLiftEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
-        self.viewer.eye = (-0.46, 0.0, -0.16)
-        self.viewer.lookat = (-0.32, 0.0, -0.16)
+        self.viewer.eye = (0.55, 0.0, -0.12)
+        self.viewer.lookat = (-0.20, 0.0, -0.20)
         self.observations.policy.enable_corruption = False
