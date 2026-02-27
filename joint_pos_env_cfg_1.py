@@ -7,6 +7,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg
@@ -60,6 +61,136 @@ def finger_object_xy_z_alignment(
     return xy_score * z_score
 
 
+def gripper_close_progress_only(
+    env,
+    open_targets: tuple[float, float, float, float],
+    close_targets: tuple[float, float, float, float],
+    robot_cfg: SceneEntityCfg,
+):
+    """Dense reward for closing motion itself (independent from lift)."""
+    robot = env.scene[robot_cfg.name]
+    q = robot.data.joint_pos[:, robot_cfg.joint_ids]
+    q_open = torch.tensor(open_targets, device=q.device).unsqueeze(0)
+    q_close = torch.tensor(close_targets, device=q.device).unsqueeze(0)
+    denom = q_close - q_open
+    close_progress = torch.where(
+        denom > 0.0,
+        (q - q_open) / (denom + 1e-6),
+        (q_open - q) / ((q_open - q_close) + 1e-6),
+    )
+    return torch.clamp(close_progress, min=0.0, max=1.0).mean(dim=1)
+
+
+def gated_gripper_close_reward(
+    env,
+    open_targets: tuple[float, float, float, float],
+    close_targets: tuple[float, float, float, float],
+    robot_cfg: SceneEntityCfg,
+    finger_frame_cfg: SceneEntityCfg = SceneEntityCfg("finger_frame"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    xy_std: float = 0.12,
+    z_std: float = 0.05,
+):
+    """Close reward gated by proximity/alignment so far-away closing is not rewarded."""
+    close_progress = gripper_close_progress_only(
+        env=env,
+        open_targets=open_targets,
+        close_targets=close_targets,
+        robot_cfg=robot_cfg,
+    )
+    align_score = finger_object_xy_z_alignment(
+        env=env,
+        xy_std=xy_std,
+        z_std=z_std,
+        finger_frame_cfg=finger_frame_cfg,
+        object_cfg=object_cfg,
+    )
+    return close_progress * align_score
+
+
+def grasp_success_condition(
+    env,
+    close_threshold: float,
+    align_threshold: float,
+    contact_force_threshold: float,
+    hold_steps: int,
+    open_targets: tuple[float, float, float, float],
+    close_targets: tuple[float, float, float, float],
+    robot_cfg: SceneEntityCfg,
+    finger_frame_cfg: SceneEntityCfg = SceneEntityCfg("finger_frame"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    contact_cfg: SceneEntityCfg = SceneEntityCfg("gripper_object_contact"),
+    left_body_pattern: str = "rh_p12_rn_l.*",
+    right_body_pattern: str = "rh_p12_rn_r.*",
+    align_xy_std: float = 0.12,
+    align_z_std: float = 0.05,
+):
+    """Binary grasp success: close + align + both-side contact sustained for hold_steps."""
+    close_progress = gripper_close_progress_only(
+        env=env,
+        open_targets=open_targets,
+        close_targets=close_targets,
+        robot_cfg=robot_cfg,
+    )
+    align_score = finger_object_xy_z_alignment(
+        env=env,
+        xy_std=align_xy_std,
+        z_std=align_z_std,
+        finger_frame_cfg=finger_frame_cfg,
+        object_cfg=object_cfg,
+    )
+
+    contact_sensor = env.scene[contact_cfg.name]
+    left_ids, _ = contact_sensor.find_bodies(left_body_pattern)
+    right_ids, _ = contact_sensor.find_bodies(right_body_pattern)
+    if len(left_ids) == 0 or len(right_ids) == 0:
+        return torch.zeros_like(close_progress, dtype=torch.bool)
+
+    force_hist = torch.norm(contact_sensor.data.net_forces_w_history, dim=-1)  # (N, H, B)
+    hold_steps = max(1, min(hold_steps, force_hist.shape[1]))
+    left_contact_hold = (force_hist[:, :hold_steps, left_ids] > contact_force_threshold).any(dim=2).all(dim=1)
+    right_contact_hold = (force_hist[:, :hold_steps, right_ids] > contact_force_threshold).any(dim=2).all(dim=1)
+
+    return (close_progress > close_threshold) & (align_score > align_threshold) & left_contact_hold & right_contact_hold
+
+
+def grasp_success_bonus(
+    env,
+    close_threshold: float,
+    align_threshold: float,
+    contact_force_threshold: float,
+    hold_steps: int,
+    open_targets: tuple[float, float, float, float],
+    close_targets: tuple[float, float, float, float],
+    robot_cfg: SceneEntityCfg,
+    finger_frame_cfg: SceneEntityCfg = SceneEntityCfg("finger_frame"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    contact_cfg: SceneEntityCfg = SceneEntityCfg("gripper_object_contact"),
+    left_body_pattern: str = "rh_p12_rn_l.*",
+    right_body_pattern: str = "rh_p12_rn_r.*",
+    align_xy_std: float = 0.12,
+    align_z_std: float = 0.05,
+):
+    """Sparse bonus when grasp_success_condition is satisfied."""
+    return grasp_success_condition(
+        env=env,
+        close_threshold=close_threshold,
+        align_threshold=align_threshold,
+        contact_force_threshold=contact_force_threshold,
+        hold_steps=hold_steps,
+        open_targets=open_targets,
+        close_targets=close_targets,
+        robot_cfg=robot_cfg,
+        finger_frame_cfg=finger_frame_cfg,
+        object_cfg=object_cfg,
+        contact_cfg=contact_cfg,
+        left_body_pattern=left_body_pattern,
+        right_body_pattern=right_body_pattern,
+        align_xy_std=align_xy_std,
+        align_z_std=align_z_std,
+    ).float()
+
+
 @configclass
 class E0509CubeLiftEnvCfg(LiftEnvCfg):
     """Simplified E0509 lift curriculum.
@@ -94,7 +225,8 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
 
         self.scene.robot.actuators["arm"].stiffness = 800.0
         self.scene.robot.actuators["arm"].damping = 60.0
-        self.scene.robot.actuators["arm"].velocity_limit = 0.5
+        # Increase arm joint velocity ceiling to avoid overly sluggish motion.
+        self.scene.robot.actuators["arm"].velocity_limit = 0.9
         self.scene.robot.actuators["gripper"].effort_limit = 300.0
         self.scene.robot.actuators["gripper"].velocity_limit = 0.06
         self.scene.robot.actuators["gripper"].stiffness = 2000.0
@@ -109,10 +241,10 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
             "joint_4": 0.0,
             "joint_5": 1.3,
             "joint_6": 1.5708,
-            "rh_l1": 0.14835,
-            "rh_r1": 0.14835,
-            "rh_l2": 0.00873,
-            "rh_r2": 0.00873,
+            "rh_l1": 0.02,
+            "rh_r1": 0.02,
+            "rh_l2": 0.02,
+            "rh_r2": 0.02,
         }
 
         self.actions.arm_action = mdp.JointPositionActionCfg(
@@ -122,19 +254,19 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
             asset_name="robot",
             joint_names=["rh_l1", "rh_r1", "rh_l2", "rh_r2"],
             open_command_expr={
-                "rh_l1": 0.14835,
-                "rh_r1": 0.14835,
-                "rh_l2": 0.00873,
-                "rh_r2": 0.00873,
+                "rh_l1": 0.02,
+                "rh_r1": 0.02,
+                "rh_l2": 0.02,
+                "rh_r2": 0.02,
             },
             close_command_expr={
-                "rh_l1": 1.25,
-                "rh_r1": 1.25,
-                "rh_l2": -1.00,
-                "rh_r2": -1.00,
+                "rh_l1": 0.95993,  # 55 deg
+                "rh_r1": 0.95993,  # 55 deg
+                "rh_l2": 0.78540,  # 45 deg
+                "rh_r2": 0.78540,  # 45 deg
             },
-            threshold=0.2,
-            positive_threshold=False,
+            threshold=0.0,
+            positive_threshold=True,
         )
 
         self.commands.object_pose.body_name = "link_6"
@@ -230,6 +362,13 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
             debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/table"],
         )
+        self.scene.gripper_object_contact = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/e0509/e0509/.*",
+            update_period=self.sim.dt,
+            history_length=5,
+            debug_vis=False,
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+        )
 
         self.events.reset_object_position.params["pose_range"] = {
             "x": (-0.02, 0.02),
@@ -256,10 +395,10 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
         if stage == 1:
             # Reach only: keep gripper open/fixed.
             gripper_open = {
-                "rh_l1": 0.14835,
-                "rh_r1": 0.14835,
-                "rh_l2": 0.00873,
-                "rh_r2": 0.00873,
+                "rh_l1": 0.02,
+                "rh_r1": 0.02,
+                "rh_l2": 0.02,
+                "rh_r2": 0.02,
             }
             self.actions.gripper_action.open_command_expr = gripper_open
             self.actions.gripper_action.close_command_expr = gripper_open
@@ -285,15 +424,89 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
             self.curriculum.joint_vel = None
 
         elif stage == 2:
-            # Grasp/lift start: simple reward mix without custom terms.
-            self.actions.arm_action.scale = 0.16
-            self.rewards.reaching_object.weight = 8.0
+            # Grasp + hold stage: focus on insertion/alignment/closure, not lift.
+            # Allow larger exploration in Stage-2 grasping motions.
+            self.actions.arm_action.scale = 0.22
+            # Stage-1 resumed policies often output gripper actions near/below 0.
+            # For AbsBinaryJointPositionAction:
+            # - positive_threshold=True  -> action > threshold => open, else close
+            # This makes near-zero outputs map to CLOSE, so gripper motion appears.
+            self.actions.gripper_action.positive_threshold = True
+            # Stage-2 bootstrap: keep gripper mostly in close mode.
+            # (action range is usually [-1, 1], so threshold=1.0 means almost-always close)
+            self.actions.gripper_action.threshold = 1.0
+            self.scene.robot.actuators["gripper"].velocity_limit = 0.12
+            self.rewards.reaching_object.weight = 5.0
             self.rewards.reaching_object.params["std"] = 0.16
-            self.rewards.lifting_object.weight = 18.0
-            self.rewards.object_goal_tracking.weight = 0.0
-            self.rewards.object_goal_tracking_fine_grained.weight = 0.0
-            self.rewards.action_rate.weight = -5e-5
-            self.rewards.joint_vel.weight = -5e-5
+            self.rewards.lifting_object.weight = 0.0
+            self.rewards.object_goal_tracking.weight = 3.0
+            self.rewards.object_goal_tracking.func = gated_gripper_close_reward
+            self.rewards.object_goal_tracking.params = {
+                "open_targets": (0.02, 0.02, 0.02, 0.02),
+                "close_targets": (0.95993, 0.95993, 0.78540, 0.78540),
+                "robot_cfg": SceneEntityCfg("robot", joint_names=["rh_l1", "rh_r1", "rh_l2", "rh_r2"]),
+                "finger_frame_cfg": SceneEntityCfg("finger_frame"),
+                "object_cfg": SceneEntityCfg("object"),
+                "xy_std": 0.12,
+                "z_std": 0.05,
+            }
+            self.rewards.object_goal_tracking_fine_grained.func = finger_object_xy_z_alignment
+            self.rewards.object_goal_tracking_fine_grained.params = {
+                "xy_std": 0.12,
+                "z_std": 0.05,
+                "finger_frame_cfg": SceneEntityCfg("finger_frame"),
+                "object_cfg": SceneEntityCfg("object"),
+            }
+            self.rewards.object_goal_tracking_fine_grained.weight = 10.0
+            self.rewards.grasp_success = RewTerm(
+                func=grasp_success_bonus,
+                params={
+                    "close_threshold": 0.55,
+                    "align_threshold": 0.15,
+                    "contact_force_threshold": 0.1,
+                    "hold_steps": 1,
+                    "open_targets": (0.02, 0.02, 0.02, 0.02),
+                    "close_targets": (0.95993, 0.95993, 0.78540, 0.78540),
+                    "robot_cfg": SceneEntityCfg("robot", joint_names=["rh_l1", "rh_r1", "rh_l2", "rh_r2"]),
+                    "finger_frame_cfg": SceneEntityCfg("finger_frame"),
+                    "object_cfg": SceneEntityCfg("object"),
+                    "contact_cfg": SceneEntityCfg("gripper_object_contact"),
+                    "left_body_pattern": "rh_p12_rn_l.*",
+                    "right_body_pattern": "rh_p12_rn_r.*",
+                    "align_xy_std": 0.12,
+                    "align_z_std": 0.05,
+                },
+                weight=12.0,
+            )
+            # Stage-2 needs frequent near-table finger motion for grasp attempts.
+            # Relax table-contact termination by excluding gripper links and using
+            # a higher force threshold for arm links.
+            self.terminations.table_contact.params["sensor_cfg"] = SceneEntityCfg(
+                "contact_forces", body_names=["link_[1-6]"]
+            )
+            self.terminations.table_contact.params["threshold"] = 1.0
+            self.terminations.grasp_success = DoneTerm(
+                func=grasp_success_condition,
+                params={
+                    "close_threshold": 0.55,
+                    "align_threshold": 0.15,
+                    "contact_force_threshold": 0.1,
+                    "hold_steps": 1,
+                    "open_targets": (0.02, 0.02, 0.02, 0.02),
+                    "close_targets": (0.95993, 0.95993, 0.78540, 0.78540),
+                    "robot_cfg": SceneEntityCfg("robot", joint_names=["rh_l1", "rh_r1", "rh_l2", "rh_r2"]),
+                    "finger_frame_cfg": SceneEntityCfg("finger_frame"),
+                    "object_cfg": SceneEntityCfg("object"),
+                    "contact_cfg": SceneEntityCfg("gripper_object_contact"),
+                    "left_body_pattern": "rh_p12_rn_l.*",
+                    "right_body_pattern": "rh_p12_rn_r.*",
+                    "align_xy_std": 0.12,
+                    "align_z_std": 0.05,
+                },
+            )
+            # Relax motion penalties so arm can move more freely in Stage-2.
+            self.rewards.action_rate.weight = -1e-5
+            self.rewards.joint_vel.weight = -1e-5
             self.curriculum.action_rate = None
             self.curriculum.joint_vel = None
 
