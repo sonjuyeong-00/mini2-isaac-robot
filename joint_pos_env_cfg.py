@@ -446,7 +446,7 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
             self.terminations.object_reached_goal = DoneTerm(
                 func=ee_reached_object_goal,
                 params={
-                    "xy_threshold": 0.12,
+                    "xy_threshold": 0.14,
                     "z_threshold": 0.06,
                     "object_cfg": SceneEntityCfg("object"),
                     "ee_frame_cfg": SceneEntityCfg("ee_frame"),
@@ -469,8 +469,7 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
                 FrameTransformerCfg.FrameCfg(
                     prim_path="{ENV_REGEX_NS}/e0509/e0509/link_6",
                     name="end_effector",
-                    # Shift wrist frame toward finger-contact region for better Z supervision.
-                    offset=OffsetCfg(pos=[0.0, 0.0, 0.03]),
+                    offset=OffsetCfg(pos=[0.0, 0.0, 0.0]),
                 ),
             ],
         )
@@ -484,6 +483,6 @@ class E0509CubeLiftEnvCfg_PLAY(E0509CubeLiftEnvCfg):
         # 디버깅용 1개 환경
         self.scene.num_envs = 1
         self.scene.env_spacing = 2.5
-        self.viewer.eye = (0.55, 0.0, -0.12)
-        self.viewer.lookat = (-0.20, 0.0, -0.20)
+        self.viewer.eye = (1.45, 0.0, -0.12)
+        self.viewer.lookat = (-0.25, 0.0, -0.12)
         self.observations.policy.enable_corruption = False

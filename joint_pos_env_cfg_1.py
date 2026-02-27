@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import os
+import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
@@ -18,6 +19,45 @@ from isaaclab_assets.robots.e0509 import E0509_CFG
 
 from isaaclab_tasks.manager_based.manipulation.lift import mdp
 from isaaclab_tasks.manager_based.manipulation.lift.lift_env_cfg import LiftEnvCfg
+
+
+def finger_midpoint_object_frame_distance(
+    env,
+    std: float,
+    finger_frame_cfg: SceneEntityCfg = SceneEntityCfg("finger_frame"),
+    object_frame_cfg: SceneEntityCfg = SceneEntityCfg("object_frame"),
+):
+    """Dense reach reward using averaged gripper/finger frame center to object frame."""
+    finger_frame = env.scene[finger_frame_cfg.name]
+    object_frame = env.scene[object_frame_cfg.name]
+
+    # If multiple finger/gripper links match, average them to a single contact-center proxy.
+    finger_mid = finger_frame.data.target_pos_w.mean(dim=1)
+    obj_pos = object_frame.data.target_pos_w[..., 0, :]
+    dist = torch.norm(obj_pos - finger_mid, dim=1)
+    return 1.0 - torch.tanh(dist / std)
+
+
+def finger_object_xy_z_alignment(
+    env,
+    xy_std: float,
+    z_std: float,
+    finger_frame_cfg: SceneEntityCfg = SceneEntityCfg("finger_frame"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+):
+    """Reward when object center is inside finger midpoint in XY and matched in Z."""
+    finger_frame = env.scene[finger_frame_cfg.name]
+    obj = env.scene[object_cfg.name]
+
+    finger_mid = finger_frame.data.target_pos_w.mean(dim=1)
+    obj_pos = obj.data.root_pos_w
+
+    xy_dist = torch.norm((obj_pos - finger_mid)[:, :2], dim=1)
+    z_err = torch.abs(obj_pos[:, 2] - finger_mid[:, 2])
+
+    xy_score = 1.0 - torch.tanh(xy_dist / xy_std)
+    z_score = 1.0 - torch.tanh(z_err / z_std)
+    return xy_score * z_score
 
 
 @configclass
@@ -76,7 +116,7 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
         }
 
         self.actions.arm_action = mdp.JointPositionActionCfg(
-            asset_name="robot", joint_names=["joint_[1-6]"], scale=0.2, use_default_offset=True
+            asset_name="robot", joint_names=["joint_[1-6]"], scale=0.22, use_default_offset=True
         )
         self.actions.gripper_action = mdp.AbsBinaryJointPositionActionCfg(
             asset_name="robot",
@@ -152,6 +192,35 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
                 ),
             ],
         )
+        self.scene.finger_frame = FrameTransformerCfg(
+            prim_path="{ENV_REGEX_NS}/e0509/e0509/base_link",
+            debug_vis=False,
+            target_frames=[
+                FrameTransformerCfg.FrameCfg(
+                    prim_path="{ENV_REGEX_NS}/e0509/e0509/rh_.*",
+                    name="finger_set",
+                    offset=OffsetCfg(pos=[0.0, 0.0, 0.0]),
+                ),
+            ],
+        )
+        self.scene.object_frame = FrameTransformerCfg(
+            prim_path="{ENV_REGEX_NS}/Object",
+            debug_vis=False,
+            target_frames=[
+                FrameTransformerCfg.FrameCfg(
+                    prim_path="{ENV_REGEX_NS}/Object",
+                    name="object_center",
+                    # Slightly below center to bias the gripper midpoint to descend more.
+                    offset=OffsetCfg(pos=[0.0, 0.0, -0.01]),
+                ),
+            ],
+        )
+        self.rewards.reaching_object.func = finger_midpoint_object_frame_distance
+        self.rewards.reaching_object.params = {
+            "std": 0.14,
+            "finger_frame_cfg": SceneEntityCfg("finger_frame"),
+            "object_frame_cfg": SceneEntityCfg("object_frame"),
+        }
 
         # Optional table-contact termination sensor
         self.scene.contact_forces = ContactSensorCfg(
@@ -197,12 +266,19 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
             self.actions.gripper_action.threshold = 1.0
             self.scene.robot.actuators["gripper"].velocity_limit = 1e-3
 
-            self.actions.arm_action.scale = 0.15
-            self.rewards.reaching_object.weight = 20.0
-            self.rewards.reaching_object.params["std"] = 0.07
+            self.actions.arm_action.scale = 0.20
+            self.rewards.reaching_object.weight = 24.0
+            self.rewards.reaching_object.params["std"] = 0.10
             self.rewards.lifting_object.weight = 0.0
             self.rewards.object_goal_tracking.weight = 0.0
-            self.rewards.object_goal_tracking_fine_grained.weight = 0.0
+            self.rewards.object_goal_tracking_fine_grained.func = finger_object_xy_z_alignment
+            self.rewards.object_goal_tracking_fine_grained.params = {
+                "xy_std": 0.05,
+                "z_std": 0.015,
+                "finger_frame_cfg": SceneEntityCfg("finger_frame"),
+                "object_cfg": SceneEntityCfg("object"),
+            }
+            self.rewards.object_goal_tracking_fine_grained.weight = 16.0
             self.rewards.action_rate.weight = -1e-5
             self.rewards.joint_vel.weight = -1e-5
             self.curriculum.action_rate = None
@@ -210,9 +286,9 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
 
         elif stage == 2:
             # Grasp/lift start: simple reward mix without custom terms.
-            self.actions.arm_action.scale = 0.12
+            self.actions.arm_action.scale = 0.16
             self.rewards.reaching_object.weight = 8.0
-            self.rewards.reaching_object.params["std"] = 0.12
+            self.rewards.reaching_object.params["std"] = 0.16
             self.rewards.lifting_object.weight = 18.0
             self.rewards.object_goal_tracking.weight = 0.0
             self.rewards.object_goal_tracking_fine_grained.weight = 0.0
@@ -223,9 +299,9 @@ class E0509CubeLiftEnvCfg(LiftEnvCfg):
 
         else:
             # Full lift.
-            self.actions.arm_action.scale = 0.12
+            self.actions.arm_action.scale = 0.14
             self.rewards.reaching_object.weight = 4.0
-            self.rewards.reaching_object.params["std"] = 0.10
+            self.rewards.reaching_object.params["std"] = 0.14
             self.rewards.lifting_object.weight = 20.0
             self.rewards.object_goal_tracking.weight = 10.0
             self.rewards.object_goal_tracking_fine_grained.weight = 3.0
@@ -239,6 +315,6 @@ class E0509CubeLiftEnvCfg_PLAY(E0509CubeLiftEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
-        self.viewer.eye = (0.55, 0.0, -0.12)
-        self.viewer.lookat = (-0.20, 0.0, -0.20)
+        self.viewer.eye = (1.45, 0.0, -0.12)
+        self.viewer.lookat = (-0.25, 0.0, -0.12)
         self.observations.policy.enable_corruption = False
